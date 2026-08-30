@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>근피로 밴드 상태판</title>
+  <style>
+    :root { color-scheme: light; font-family: "Malgun Gothic", system-ui, sans-serif; }
+    body { margin: 0; background: #f3f6fa; color: #18212f; }
+    main { max-width: 1280px; margin: 0 auto; padding: 28px 20px 40px; }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    .sub { color: #5b6574; margin-bottom: 20px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; }
+    button { border: 0; border-radius: 10px; padding: 11px 20px; font-size: 16px;
+      font-weight: 700; cursor: pointer; background: #2864dc; color: white; }
+    button:disabled { background: #98a4b7; cursor: default; }
+    #connection { font-weight: 700; color: #9b2c2c; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .card { background: white; border-radius: 15px; padding: 18px 20px;
+      box-shadow: 0 3px 14px #18315314; border: 1px solid #dfe5ed; }
+    .wide { grid-column: 1 / -1; }
+    .label { font-size: 14px; color: #667386; margin-bottom: 8px; }
+    .value { font-size: 25px; line-height: 1.35; font-weight: 800; word-break: keep-all; }
+    .small { font-size: 18px; font-weight: 650; }
+    .progress { height: 18px; margin-top: 12px; background: #e8edf4; border-radius: 9px; overflow: hidden; }
+    .bar { width: 0%; height: 100%; background: #e59b20; transition: width .25s ease; }
+    .measuring { color: #245fc4; }
+    .good { color: #16814b; }
+    .warn { color: #c07800; }
+    .danger { color: #c53030; }
+    .active { color: #8b35c9; }
+    .note { margin-top: 18px; color: #596679; font-size: 14px; line-height: 1.6; }
+    .layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(290px, 1fr); gap: 16px; align-items: start; }
+    .memo { position: sticky; top: 16px; }
+    #fatigueLog { width: 100%; min-height: 430px; resize: vertical; box-sizing: border-box;
+      border: 1px solid #ccd5e2; border-radius: 10px; padding: 12px; background: #fbfcfe;
+      color: #263244; font: 14px/1.55 "Malgun Gothic", monospace; }
+    .memo-actions { display: flex; gap: 8px; margin-top: 10px; }
+    .memo-actions button { flex: 1; padding: 9px 10px; font-size: 14px; }
+    .secondary { background: #64748b; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .memo { position: static; } }
+    @media (max-width: 650px) { .grid { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>근피로 밴드 상태판</h1>
+  <div class="sub">그래프 없이 필요한 상태만 표시합니다.</div>
+  <div class="toolbar">
+    <button id="connectButton">ESP32 연결</button>
+    <button id="heaterPauseButton" class="secondary" disabled>발열 일시중지</button>
+    <span id="connection">연결 안 됨</span>
+  </div>
+
+  <div class="layout">
+  <section class="grid">
+    <article class="card wide">
+      <div class="label">기준값 측정</div>
+      <div class="value measuring" id="baseline">측정 전 또는 수신 대기</div>
+      <div class="small" id="mdfBaseline">기준 MDF: 측정 전</div>
+    </article>
+
+    <article class="card">
+      <div class="label">현재 근신호(RMS)</div>
+      <div class="value" id="currentRms">--</div>
+      <div class="small" id="contraction">수축 여부: 판정 대기</div>
+    </article>
+    <article class="card">
+      <div class="label">기준값과 현재 신호 비교</div>
+      <div class="value small" id="baselineCompare">기준값 측정 후 표시</div>
+    </article>
+
+    <article class="card wide">
+      <div class="label">현재 MDF 측정</div>
+      <div class="value small" id="currentMdf">MDF 대기 — 근육 수축과 정지 상태가 필요합니다</div>
+    </article>
+
+    <article class="card">
+      <div class="label">세션 MDF 변화율 / 분당 변화율</div>
+      <div class="value" id="mdfChange">-- %</div>
+    </article>
+    <article class="card">
+      <div class="label">세션 RMS 변화율 / 분당 변화율</div>
+      <div class="value" id="rmsChange">-- %</div>
+      <div class="small" id="rmsCondition">RMS 조건: 판정 대기</div>
+    </article>
+
+    <article class="card wide">
+      <div class="label">근피로 기준 도달률 (MDF 15% 하강 = 100%)</div>
+      <div class="value" id="progressText">0.0 %</div>
+      <div class="progress"><div class="bar" id="progressBar"></div></div>
+    </article>
+
+    <article class="card wide">
+      <div class="label">근피로 판정</div>
+      <div class="value warn" id="fatigue">판정 대기 — 정지 구간은 MDF+RMS, 동작 구간은 RMS로 판정</div>
+      <div class="small" id="confirmTime">근피로판정 누적시간: 0/30초</div>
+    </article>
+
+    <article class="card">
+      <div class="label">현재 온도</div>
+      <div class="value" id="temperature">-- °C</div>
+    </article>
+    <article class="card">
+      <div class="label">진동·발열 동작</div>
+      <div class="value small" id="intervention">대기</div>
+    </article>
+
+    <article class="card wide">
+      <div class="label">현재 동작</div>
+      <div class="value" id="system">데이터 대기</div>
+    </article>
+  </section>
+
+  <aside class="card memo">
+    <div class="label">근피로 기록 메모</div>
+    <textarea id="fatigueLog" readonly placeholder="근피로판정이 발생하면 날짜와 시간이 여기에 기록됩니다."></textarea>
+    <div class="memo-actions">
+      <button id="downloadLog">TXT 저장</button>
+      <button id="clearLog" class="secondary">기록 지우기</button>
+    </div>
+  </aside>
+  </div>
+
+  <div class="note">
+    기준값을 다시 측정하려면 기기의 확인 버튼(GPIO27)을 누르세요. 3초 카운트다운 후 약 10초간 힘을 빼고 움직이지 마세요.<br>
+    이 화면을 연결하기 전에 Arduino IDE의 시리얼 모니터와 시리얼 플로터를 모두 닫아야 합니다.
+  </div>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const connectButton = $("connectButton");
+  let port = null;
+  let reader = null;
+  let reading = false;
+  let pending = "";
+  let contactBad = false;
+  let baselineMean = null;
+  let baselineStd = null;
+  let baselineMdf = null;
+  let fatiguePreviouslyConfirmed = false;
+  const fatigueLogStorageKey = "stage5-fatigue-log-v1";
+  let fatigueLogEntries = [];
+
+  function renderFatigueLog() {
+    $("fatigueLog").value = fatigueLogEntries.length
+      ? fatigueLogEntries.join("\n")
+      : "";
+  }
+
+  function loadFatigueLog() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(fatigueLogStorageKey) || "[]");
+      fatigueLogEntries = Array.isArray(saved) ? saved : [];
+    } catch (_) {
+      fatigueLogEntries = [];
+    }
+    renderFatigueLog();
+  }
+
+  function addFatigueLog(mdf, rms, mdfRate, rmsRate, activeSeconds) {
+    const recordedAt = new Date().toLocaleString("ko-KR", { hour12: false });
+    fatigueLogEntries.push(
+      `[${recordedAt}] 근피로판정 | MDF ${mdf.toFixed(1)}% (${mdfRate.toFixed(1)}%/분) | ` +
+      `RMS ${rms.toFixed(1)}% (${rmsRate.toFixed(1)}%/분) | 유효 수축 ${activeSeconds}초`
+    );
+    try { localStorage.setItem(fatigueLogStorageKey, JSON.stringify(fatigueLogEntries)); } catch (_) {}
+    renderFatigueLog();
+    $("fatigueLog").scrollTop = $("fatigueLog").scrollHeight;
+  }
+
+  function addMovingFatigueLog(rms, rmsRate) {
+    const recordedAt = new Date().toLocaleString("ko-KR", { hour12: false });
+    fatigueLogEntries.push(
+      `[${recordedAt}] 동작 구간 근피로판정 | RMS ${rms.toFixed(1)}% ` +
+      `(${rmsRate.toFixed(1)}%/분) | MDF 제외`
+    );
+    try { localStorage.setItem(fatigueLogStorageKey, JSON.stringify(fatigueLogEntries)); } catch (_) {}
+    renderFatigueLog();
+    $("fatigueLog").scrollTop = $("fatigueLog").scrollHeight;
+  }
+
+  const stateNames = {
+    0: "사용 안 함", 1: "데이터 대기", 2: "근피로 측정 중",
+    3: "진동 중", 4: "발열 중", 5: "자동 재측정 중",
+    6: "센서 접촉 확인 필요", 7: "기준값 저장 중",
+    8: "기준값 반영 중", 9: "시스템 오류", 10: "치료 완료 — 확인 버튼으로 기준값을 다시 측정하세요"
+  };
+
+  function setSystem(text) {
+    const el = $("system");
+    el.textContent = text;
+    el.className = "value";
+    if (text.includes("진동")) el.classList.add("active");
+    else if (text.includes("발열")) el.classList.add("danger");
+    else if (text.includes("오류") || text.includes("확인")) el.classList.add("warn");
+    else if (text.includes("측정")) el.classList.add("measuring");
+  }
+
+  function setProgress(value) {
+    const progress = Math.max(0, Math.min(100, value));
+    $("progressText").textContent = `${progress.toFixed(1)} %`;
+    $("progressBar").style.width = `${progress}%`;
+  }
+
+  function parseNumber(line, name) {
+    const match = line.match(new RegExp(`${name}=([-+0-9.eE]+)`));
+    return match ? Number(match[1]) : null;
+  }
+
+  function updateSignalComparison(rms, contracting) {
+    $("currentRms").textContent = Number.isFinite(rms) ? rms.toFixed(6) : "--";
+    $("contraction").textContent = `수축 여부: ${contracting ? "수축 중" : "힘을 주지 않음"}`;
+    $("contraction").className = `small ${contracting ? "active" : ""}`;
+    if (baselineMean !== null && baselineStd !== null && baselineMean > 0) {
+      const startThreshold = baselineMean + 3.0 * baselineStd;
+      const change = (rms - baselineMean) / baselineMean * 100;
+      $("baselineCompare").textContent =
+        `기준 RMS ${baselineMean.toFixed(6)}\n수축 시작 기준 ${startThreshold.toFixed(6)}\n기준 대비 ${change >= 0 ? "+" : ""}${change.toFixed(1)}%`;
+      $("baselineCompare").style.whiteSpace = "pre-line";
+    }
+  }
+
+  function parseLine(line) {
+    line = line.trim();
+    if (!line) return;
+
+    if (line.startsWith("CALIB_COUNTDOWN,")) {
+      const seconds = Number(line.split(",")[1]);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        $("baseline").textContent = `${seconds}초 후 기준값 측정을 시작합니다 — 힘을 빼고 준비하세요`;
+        $("baseline").className = "value warn";
+      }
+      return;
+    }
+
+    if (line === "RELAX_MUSCLE_FOR_RMS_BASELINE" ||
+        line === "RMS_RECALIBRATING" ||
+        line === "RMS_RECALIBRATING_BUTTON" ||
+        line.startsWith("기준값측정시작")) {
+      $("baseline").textContent = "측정 중 — 힘을 빼고 움직이지 마세요";
+      $("baseline").className = "value measuring";
+      baselineMean = null;
+      baselineStd = null;
+      baselineMdf = null;
+      $("mdfBaseline").textContent = "기준 MDF: 측정 중";
+      $("mdfBaseline").className = "small measuring";
+      contactBad = false;
+      $("currentRms").textContent = "--";
+      $("contraction").textContent = "수축 여부: 기준값 측정 중";
+      $("contraction").className = "small";
+      $("baselineCompare").textContent = "기준값 측정 후 표시";
+      $("mdfChange").textContent = "-- %";
+      $("rmsChange").textContent = "-- %";
+      $("rmsCondition").textContent = "RMS 조건: 판정 대기";
+      $("rmsCondition").className = "small";
+      $("currentMdf").textContent = "MDF 대기 — 기준값 측정 중";
+      $("currentMdf").className = "value small warn";
+      $("fatigue").textContent = "판정 대기 — 새 기준값 측정 중";
+      $("fatigue").className = "value warn";
+      setProgress(0);
+      return;
+    }
+
+    if (line.startsWith("기준값측정완료,")) {
+      const mean = parseNumber(line, "평균RMS");
+      const std = parseNumber(line, "표준편차");
+      baselineMean = mean;
+      baselineStd = std;
+      $("baseline").textContent = `측정 완료  |  평균 RMS ${mean?.toFixed(6) ?? "?"}  |  표준편차 ${std?.toFixed(6) ?? "?"}`;
+      $("baseline").className = "value good";
+      contactBad = false;
+      return;
+    }
+
+    if (line.startsWith("MDF_BASELINE_COMPLETE,")) {
+      const fields = line.split(",");
+      const mdf = Number(fields[1]);
+      const samples = parseNumber(line, "SAMPLES");
+      if (Number.isFinite(mdf) && mdf > 0) {
+        baselineMdf = mdf;
+        $("mdfBaseline").textContent =
+          `기준 MDF: ${mdf.toFixed(2)} Hz  |  유효 표본 ${Number.isFinite(samples) ? samples : "?"}개`;
+        $("mdfBaseline").className = "small good";
+      }
+      return;
+    }
+
+    if (line === "MDF_BASELINE_FAILED") {
+      baselineMdf = null;
+      $("mdfBaseline").textContent =
+        "기준 MDF 측정 실패 — 힘을 빼고 움직이지 않은 상태에서 다시 측정하세요";
+      $("mdfBaseline").className = "small danger";
+      return;
+    }
+
+    if (line.startsWith("CALIB_TIME,")) {
+      const fields = line.split(",");
+      const elapsed = Number(fields[1]);
+      const totalMs = Number(fields[2]);
+      const progress = totalMs > 0 ? Math.min(100, elapsed * 100 / totalMs) : 0;
+      const seconds = Math.min(totalMs, elapsed) / 1000;
+      if (contactBad) {
+        $("baseline").textContent = `접촉 불안정 — 기준값 측정 ${seconds.toFixed(1)}/10.0초 (${progress.toFixed(1)}%)`;
+        $("baseline").className = "value danger";
+      } else {
+        $("baseline").textContent = `측정 중 ${seconds.toFixed(1)}/10.0초 (${progress.toFixed(1)}%) — 힘을 빼고 움직이지 마세요`;
+        $("baseline").className = "value measuring";
+      }
+      return;
+    }
+
+    if (line.startsWith("기준값측정실패") || line.startsWith("RMS_BASELINE_QUALITY_FAILED")) {
+      $("baseline").textContent = "측정 실패 — 전극 접촉과 주변 노이즈를 확인하세요";
+      $("baseline").className = "value danger";
+      return;
+    }
+
+    if (line.startsWith("접촉불량,")) {
+      contactBad = true;
+      $("baseline").textContent = "전극 접촉 불량 또는 EMG 신호 이상 — 전극과 배선을 확인하세요";
+      $("baseline").className = "value danger";
+      $("fatigue").textContent = "판정 중지 — 접촉 불량";
+      $("fatigue").className = "value danger";
+      setSystem("센서 접촉 확인 필요");
+      return;
+    }
+
+    if (line.startsWith("접촉정상,")) {
+      contactBad = false;
+      $("baseline").textContent = "접촉 정상 — 기준값을 처음부터 다시 수집 중";
+      $("baseline").className = "value measuring";
+      $("fatigue").textContent = "판정 대기 — 기준값 측정 중";
+      $("fatigue").className = "value warn";
+      return;
+    }
+
+    // 상태판을 늦게 연결해 완료 이벤트를 놓쳤어도 주기적인 현재 상태로 복구한다.
+    if (line.startsWith("status=")) {
+      const ready = parseNumber(line, "baselineReady");
+      const mean = parseNumber(line, "baselineMean");
+      const std = parseNumber(line, "baselineStd");
+      if (ready === 1) {
+        baselineMean = mean;
+        baselineStd = std;
+        $("baseline").textContent = `측정 완료  |  평균 RMS ${mean?.toFixed(6) ?? "?"}  |  표준편차 ${std?.toFixed(6) ?? "?"}`;
+        $("baseline").className = "value good";
+      }
+      return;
+    }
+
+    if (line.startsWith("LIVE,")) {
+      const fields = line.split(",");
+      const state = Number(fields[1]);
+      const rms = Number(fields[2]);
+      const mean = Number(fields[3]);
+      const std = Number(fields[4]);
+      const contracting = Number(fields[5]) === 1;
+      const temperature = Number(fields[6]);
+      const vibrationOn = Number(fields[7]) === 1;
+      const heaterOn = Number(fields[8]) === 1;
+      const heaterPaused = Number(fields[9]) === 1;
+      const setTemperature = Number(fields[10]);
+      const pendingTemperature = Number(fields[11]);
+      const temperatureDirty = Number(fields[12]) === 1;
+      if (mean > 0) baselineMean = mean;
+      if (std >= 0) baselineStd = std;
+      updateSignalComparison(rms, contracting);
+      setSystem(stateNames[state] ?? `알 수 없는 상태 ${state}`);
+      $("heaterPauseButton").disabled = !port || state !== 4;
+      $("heaterPauseButton").textContent = heaterPaused ? "발열 다시 시작" : "발열 일시중지";
+      if (Number.isFinite(temperature) && temperature > -55 &&
+          temperature < 125 && Math.abs(temperature - 85) > 1 &&
+          Math.abs(temperature + 127) > 1) {
+        const settingText = temperatureDirty
+          ? ` | 선택 ${pendingTemperature.toFixed(0)}°C (확인 필요)`
+          : ` | 설정 ${setTemperature.toFixed(0)}°C`;
+        $("temperature").textContent = `${temperature.toFixed(1)} °C${settingText}`;
+        $("temperature").className = `value ${temperature >= 45 ? "danger" : temperature >= 38 ? "warn" : "good"}`;
+      } else {
+        $("temperature").textContent = "온도센서 확인 필요";
+        $("temperature").className = "value small danger";
+      }
+      if (state === 3) {
+        $("intervention").textContent = vibrationOn ? "진동 중 — 3초 동작" : "진동 전환 중";
+        $("intervention").className = "value small active";
+      } else if (state === 4) {
+        $("intervention").textContent = heaterPaused ? "발열 일시중지됨" :
+          (heaterOn ? "발열 중 — 히터 ON" : "발열 중 — 온도 유지(히터 OFF)");
+        $("intervention").className = "value small danger";
+      } else if (state === 10) {
+        $("intervention").textContent = "진동·발열 완료";
+        $("intervention").className = "value small good";
+        $("baseline").textContent = "치료 완료 — 힘을 뺀 뒤 확인 버튼을 눌러 기준값을 다시 측정하세요";
+        $("baseline").className = "value warn";
+      } else {
+        $("intervention").textContent = "대기";
+        $("intervention").className = "value small";
+      }
+      return;
+    }
+
+    if (line.startsWith("TEMP_SET_PENDING,")) {
+      const value = Number(line.split(",")[1]);
+      if (Number.isFinite(value)) {
+        $("intervention").textContent = `온도 ${value.toFixed(0)}°C 선택 — 확인 버튼을 누르세요`;
+        $("intervention").className = "value small warn";
+      }
+      return;
+    }
+
+    if (line.startsWith("TEMP_SET_CONFIRMED,")) {
+      const value = Number(line.split(",")[1]);
+      if (Number.isFinite(value)) {
+        $("intervention").textContent = `발열 설정 ${value.toFixed(0)}°C 적용됨`;
+        $("intervention").className = "value small good";
+      }
+      return;
+    }
+
+    if (line.startsWith("DATA,")) {
+      const fields = line.split(",");
+      if (fields.length >= 8) {
+        const rms = Number(fields[2]);
+        const contracting = Number(fields[3]) === 1;
+        const imuStatic = Number(fields[4]) === 1;
+        const mdfEligible = Number(fields[5]) === 1;
+        const mdf = Number(fields[6]);
+        updateSignalComparison(rms, contracting);
+        if (!imuStatic) {
+          $("contraction").textContent = "동작 구간 — RMS만 측정";
+          $("contraction").className = "small active";
+        } else if (contracting) {
+          $("contraction").textContent = "정지 수축 구간 — RMS + MDF 측정";
+          $("contraction").className = "small good";
+        } else {
+          $("contraction").textContent = "휴식 구간 — RMS + MDF 측정";
+          $("contraction").className = "small";
+        }
+        if (mdfEligible && mdf > 0) {
+          $("currentMdf").textContent = `MDF 측정 중: ${mdf.toFixed(1)} Hz`;
+          $("currentMdf").className = "value small good";
+        } else if (!imuStatic) {
+          $("currentMdf").textContent = "동작 구간 — MDF 제외, RMS만 측정 중";
+          $("currentMdf").className = "value small warn";
+        } else {
+          $("currentMdf").textContent = "정지 구간 MDF 계산 중";
+          $("currentMdf").className = "value small measuring";
+        }
+      }
+      return;
+    }
+
+    if (line.startsWith("FATIGUE_TREND,")) {
+      const mdf = parseNumber(line, "MDF_CHANGE_PERCENT");
+      const rms = parseNumber(line, "RMS_CHANGE_PERCENT");
+      const mdfRate = parseNumber(line, "MDF_RATE_PER_MINUTE");
+      const rmsRate = parseNumber(line, "RMS_RATE_PER_MINUTE");
+      const activeSeconds = parseNumber(line, "ACTIVE_SECONDS");
+      const detected = parseNumber(line, "DETECTED");
+      const confirmSeconds = parseNumber(line, "CONFIRM_SECONDS");
+      const fatigued = parseNumber(line, "FATIGUED");
+      if (mdf !== null) {
+        $("mdfChange").textContent =
+          `${mdf >= 0 ? "+" : ""}${mdf.toFixed(1)} %\n` +
+          `${mdfRate !== null && mdfRate >= 0 ? "+" : ""}${mdfRate?.toFixed(1) ?? "--"} %/분`;
+        $("mdfChange").style.whiteSpace = "pre-line";
+        if (mdfRate !== null) setProgress((-mdfRate / 15) * 100);
+      }
+      if (rms !== null) {
+        $("rmsChange").textContent =
+          `${rms >= 0 ? "+" : ""}${rms.toFixed(1)} %\n` +
+          `${rmsRate !== null && rmsRate >= 0 ? "+" : ""}${rmsRate?.toFixed(1) ?? "--"} %/분`;
+        $("rmsChange").style.whiteSpace = "pre-line";
+        const pass = rms >= -20;
+        $("rmsCondition").textContent = `RMS 조건: ${pass ? "통과" : "실패"}`;
+        $("rmsCondition").className = `small ${pass ? "good" : "danger"}`;
+      }
+      if (fatigued === 1) {
+        $("fatigue").textContent = "근피로 확정 — 측정을 멈추고 치료를 시작합니다";
+        $("fatigue").className = "value danger";
+        fatiguePreviouslyConfirmed = true;
+        $("confirmTime").textContent = "근피로판정 누적시간: 30/30초 — 확정";
+        $("confirmTime").className = "small danger";
+      } else if (detected === 1) {
+        const held = Math.max(0, Math.min(30, confirmSeconds || 0));
+        $("fatigue").textContent = "근피로판정 — 누적 30초 도달 시 근피로 확정";
+        $("fatigue").className = "value warn";
+        $("confirmTime").textContent = `근피로판정 누적시간: ${held}/30초`;
+        $("confirmTime").className = "small warn";
+        if (!fatiguePreviouslyConfirmed && mdf !== null && rms !== null &&
+            mdfRate !== null && rmsRate !== null && activeSeconds !== null) {
+          addFatigueLog(mdf, rms, mdfRate, rmsRate, activeSeconds);
+        }
+        fatiguePreviouslyConfirmed = true;
+      } else {
+        $("fatigue").textContent = "아직 근피로 조건 미충족";
+        $("fatigue").className = "value warn";
+        const held = Math.max(0, Math.min(30, confirmSeconds || 0));
+        $("confirmTime").textContent = `근피로판정 누적시간: ${held}/30초`;
+        $("confirmTime").className = "small";
+        fatiguePreviouslyConfirmed = false;
+      }
+      return;
+    }
+
+    if (line.startsWith("MOVING_RMS_TREND,")) {
+      const rms = parseNumber(line, "RMS_CHANGE_PERCENT");
+      const rmsRate = parseNumber(line, "RMS_RATE_PER_MINUTE");
+      const detected = parseNumber(line, "DETECTED");
+      const confirmSeconds = parseNumber(line, "CONFIRM_SECONDS");
+      const fatigued = parseNumber(line, "FATIGUED");
+      $("mdfChange").textContent = "동작 구간\nMDF 제외";
+      $("mdfChange").style.whiteSpace = "pre-line";
+      if (rms !== null) {
+        $("rmsChange").textContent =
+          `${rms >= 0 ? "+" : ""}${rms.toFixed(1)} %\n` +
+          `${rmsRate !== null && rmsRate >= 0 ? "+" : ""}${rmsRate?.toFixed(1) ?? "--"} %/분`;
+        $("rmsChange").style.whiteSpace = "pre-line";
+      }
+      const pass = rmsRate !== null && rmsRate >= 30;
+      $("rmsCondition").textContent = `동작 RMS 조건: ${pass ? "통과" : "실패"} (30%/분 이상)`;
+      $("rmsCondition").className = `small ${pass ? "good" : "danger"}`;
+      if (rmsRate !== null) setProgress((rmsRate / 30) * 100);
+      const held = Math.max(0, Math.min(30, confirmSeconds || 0));
+      if (fatigued === 1) {
+        $("fatigue").textContent = "근피로 확정 — 측정을 멈추고 치료를 시작합니다";
+        $("fatigue").className = "value danger";
+        $("confirmTime").textContent = "근피로판정 누적시간: 30/30초 — 확정";
+        $("confirmTime").className = "small danger";
+        fatiguePreviouslyConfirmed = true;
+      } else if (detected === 1) {
+        $("fatigue").textContent = "동작 구간 근피로판정 — 누적 30초 도달 시 근피로 확정";
+        $("fatigue").className = "value warn";
+        $("confirmTime").textContent = `근피로판정 누적시간: ${held}/30초`;
+        $("confirmTime").className = "small warn";
+        if (!fatiguePreviouslyConfirmed && rms !== null && rmsRate !== null) {
+          addMovingFatigueLog(rms, rmsRate);
+        }
+        fatiguePreviouslyConfirmed = true;
+      } else {
+        $("fatigue").textContent = "동작 구간 — 아직 RMS 피로 조건 미충족";
+        $("fatigue").className = "value warn";
+        $("confirmTime").textContent = `근피로판정 누적시간: ${held}/30초`;
+        $("confirmTime").className = "small";
+        fatiguePreviouslyConfirmed = false;
+      }
+      return;
+    }
+
+    if (line.startsWith("TREND_PROGRESS,")) {
+      const fields = line.split(",");
+      const count = Number(fields[1]);
+      const mdf = Number(fields[2]);
+      const rms = Number(fields[3]);
+      const mdfRate = Number(fields[4]);
+      const rmsRate = Number(fields[5]);
+      const activeSeconds = Number(fields[6]);
+      if (count >= 2) {
+        $("mdfChange").textContent = `${mdf >= 0 ? "+" : ""}${mdf.toFixed(1)} %\n${mdfRate >= 0 ? "+" : ""}${mdfRate.toFixed(1)} %/분`;
+        $("rmsChange").textContent = `${rms >= 0 ? "+" : ""}${rms.toFixed(1)} %\n${rmsRate >= 0 ? "+" : ""}${rmsRate.toFixed(1)} %/분`;
+        $("mdfChange").style.whiteSpace = "pre-line";
+        $("rmsChange").style.whiteSpace = "pre-line";
+        setProgress((-mdf / 15) * 100);
+      }
+      if (count < 6) {
+        $("fatigue").textContent = `세션 피로 추세 수집 중 ${count}/6 — 유효 수축 ${activeSeconds || 0}초`;
+        $("fatigue").className = "value measuring";
+      }
+      return;
+    }
+
+    if (line === "TREND_RESET") {
+      fatiguePreviouslyConfirmed = false;
+      $("mdfChange").textContent = "-- %";
+      $("rmsChange").textContent = "-- %";
+      $("rmsCondition").textContent = "RMS 조건: 판정 대기";
+      $("rmsCondition").className = "small";
+      setProgress(0);
+      $("fatigue").textContent = "판정 대기 — 수축을 유지하고 팔을 고정하세요";
+      $("fatigue").className = "value warn";
+      $("confirmTime").textContent = "근피로판정 누적시간: 0/30초";
+      $("confirmTime").className = "small";
+      return;
+    }
+
+    if (line.startsWith("STAGE5_SYSTEM_STATE=")) {
+      const match = line.match(/^STAGE5_SYSTEM_STATE=(\d+)/);
+      if (match) setSystem(stateNames[Number(match[1])] ?? `알 수 없는 상태 ${match[1]}`);
+    }
+  }
+
+  async function readLoop() {
+    const decoder = new TextDecoder();
+    reader = port.readable.getReader();
+    reading = true;
+    try {
+      while (reading) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() ?? "";
+        lines.forEach(parseLine);
+      }
+    } catch (error) {
+      $("connection").textContent = `연결 오류: ${error.message}`;
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+      reader = null;
+      reading = false;
+    }
+  }
+
+  async function connect() {
+    if (!("serial" in navigator)) {
+      alert("이 브라우저는 USB 시리얼 연결을 지원하지 않습니다. 최신 Microsoft Edge 또는 Google Chrome으로 여세요.");
+      return;
+    }
+    try {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+      $("connection").textContent = "ESP32 연결됨 (115200 baud)";
+      $("connection").style.color = "#16814b";
+      connectButton.textContent = "연결 해제";
+      readLoop();
+    } catch (error) {
+      if (error.name !== "NotFoundError") alert(`연결하지 못했습니다: ${error.message}`);
+    }
+  }
+
+  async function disconnect() {
+    reading = false;
+    if (reader) {
+      try { await reader.cancel(); } catch (_) {}
+    }
+    if (port) {
+      try { await port.close(); } catch (_) {}
+    }
+    port = null;
+    $("heaterPauseButton").disabled = true;
+    $("heaterPauseButton").textContent = "발열 일시중지";
+    $("connection").textContent = "연결 안 됨";
+    $("connection").style.color = "#9b2c2c";
+    connectButton.textContent = "ESP32 연결";
+  }
+
+  connectButton.addEventListener("click", () => port ? disconnect() : connect());
+  $("heaterPauseButton").addEventListener("click", async () => {
+    if (!port?.writable) return;
+    const writer = port.writable.getWriter();
+    try { await writer.write(new TextEncoder().encode("P\n")); }
+    finally { writer.releaseLock(); }
+  });
+  $("downloadLog").addEventListener("click", () => {
+    const content = fatigueLogEntries.length
+      ? fatigueLogEntries.join("\r\n") + "\r\n"
+      : "기록된 근피로 판정이 없습니다.\r\n";
+    const blob = new Blob(["\uFEFF", content], { type: "text/plain;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `근피로_기록_${new Date().toISOString().slice(0, 10)}.txt`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  });
+  $("clearLog").addEventListener("click", () => {
+    if (!confirm("저장된 근피로 기록을 모두 지울까요?")) return;
+    fatigueLogEntries = [];
+    try { localStorage.removeItem(fatigueLogStorageKey); } catch (_) {}
+    renderFatigueLog();
+  });
+  loadFatigueLog();
+</script>
+</body>
+</html>
