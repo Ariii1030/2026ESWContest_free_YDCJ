@@ -38,6 +38,9 @@ struct MdfOutputState;
 #ifndef BTN_OK_PIN
 #define BTN_OK_PIN 27
 #endif
+#ifndef BATTERY_ADC_PIN
+#define BATTERY_ADC_PIN 35
+#endif
 
 #if STAGE5_SYSTEM_TM1637_CLK_PIN >= 0 && \
     STAGE5_SYSTEM_TM1637_DIO_PIN >= 0
@@ -781,7 +784,19 @@ void printRmsCountdownLine(int seconds) {
 }
 
 void beginRmsCalibrationCountdown(unsigned long nowMs, const char* source) {
-  (void)source;
+  // A manual calibration must never cancel an active treatment sequence.
+  // This is the final guard for button bounce, electrical noise, or a stray
+  // serial C command arriving during vibration/heating.
+  if (directInterventionState == DIRECT_INTERVENTION_VIBRATING ||
+      directInterventionState == DIRECT_INTERVENTION_HEATING) {
+    if (serialMutex != nullptr &&
+        xSemaphoreTake(serialMutex, 0) == pdTRUE) {
+      Serial.print("CALIBRATION_IGNORED_DURING_INTERVENTION,");
+      Serial.println(source == nullptr ? "UNKNOWN" : source);
+      xSemaphoreGive(serialMutex);
+    }
+    return;
+  }
   ++manualFatigueSessionGeneration;
   if (manualFatigueSessionGeneration == 0U) {
     ++manualFatigueSessionGeneration;
@@ -2210,29 +2225,247 @@ void updateTemperatureSensor(unsigned long nowMs) {
   conversionPending = false;
 }
 
-ButtonState btnUpState;
-ButtonState btnDownState;
-ButtonState btnOkState;
-constexpr unsigned long TEMP_BUTTON_DEBOUNCE_MS = 50UL;
+struct RawPullupButtonState {
+  bool lastRawPressed = false;
+  bool stablePressed = false;
+  unsigned long lastRawChangeMs = 0UL;
+  unsigned long lastAcceptedPressMs = 0UL;
+};
+
+RawPullupButtonState btnUpState;
+RawPullupButtonState btnDownState;
+RawPullupButtonState btnOkState;
+constexpr unsigned long BUTTON_RETRIGGER_GUARD_MS = 100UL;
+constexpr unsigned long BUTTON_STABLE_MS = 40UL;
 constexpr unsigned long TEMP_SETTING_DISPLAY_MS = 2000UL;
 constexpr unsigned long TEMP_SETTING_EDIT_TIMEOUT_MS = 5000UL;
+constexpr unsigned long OK_DOUBLE_PRESS_MS = 2000UL;
+constexpr unsigned long BATTERY_DISPLAY_MS = 5000UL;
+constexpr unsigned long BATTERY_SAMPLE_INTERVAL_MS = 1000UL;
+constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // 100k ohm + 100k ohm
 float pendingSetTemperatureC = 40.0f;
 bool temperatureSettingDirty = false;
 unsigned long temperatureSettingDisplayUntilMs = 0UL;
 unsigned long temperatureSettingLastButtonMs = 0UL;
+bool okSinglePressPending = false;
+bool okSingleActionExecuted = false;
+unsigned long okFirstPressMs = 0UL;
+unsigned long batteryDisplayUntilMs = 0UL;
+volatile int batteryPercent = -1;
+volatile int batteryMillivolts = 0;
 bool hasLastDirectHeatingSegments = false;
 uint8_t lastDirectHeatingSegments[4] = {0U, 0U, 0U, 0U};
 
+bool readRawPullupPressEvent(int pin, bool& lastRawPressed,
+                            bool& stablePressed,
+                            unsigned long& lastRawChangeMs,
+                            unsigned long& lastAcceptedPressMs,
+                            unsigned long nowMs) {
+  // Same electrical interpretation as switch_test_raw_segment.ino:
+  // INPUT_PULLUP means HIGH=released and LOW=pressed. A latch converts the
+  // raw level into one event per physical press without delay().
+  const bool pressed = digitalRead(pin) == LOW;
+  if (pressed != lastRawPressed) {
+    lastRawPressed = pressed;
+    lastRawChangeMs = nowMs;
+  }
+  if (stablePressed == lastRawPressed ||
+      nowMs - lastRawChangeMs < BUTTON_STABLE_MS) {
+    return false;
+  }
+  stablePressed = lastRawPressed;
+  if (!stablePressed ||
+      nowMs - lastAcceptedPressMs < BUTTON_RETRIGGER_GUARD_MS) {
+    return false;
+  }
+  lastAcceptedPressMs = nowMs;
+  return true;
+}
+
+int lithiumBatteryPercentFromMillivolts(int millivolts) {
+  // Approximate no-load voltage curve for a single-cell 3.7 V LiPo.
+  static const int voltagePoints[] = {
+      3200, 3400, 3500, 3600, 3700, 3750, 3800, 3900, 4000, 4100, 4200};
+  static const int percentPoints[] = {
+      0, 5, 10, 20, 35, 45, 55, 70, 80, 90, 100};
+  constexpr size_t pointCount =
+      sizeof(voltagePoints) / sizeof(voltagePoints[0]);
+  if (millivolts <= voltagePoints[0]) return 0;
+  if (millivolts >= voltagePoints[pointCount - 1U]) return 100;
+  for (size_t i = 1U; i < pointCount; ++i) {
+    if (millivolts <= voltagePoints[i]) {
+      const long numerator =
+          static_cast<long>(millivolts - voltagePoints[i - 1U]) *
+          (percentPoints[i] - percentPoints[i - 1U]);
+      return percentPoints[i - 1U] +
+          static_cast<int>(numerator /
+                           (voltagePoints[i] - voltagePoints[i - 1U]));
+    }
+  }
+  return 100;
+}
+
+void updateBatteryMeasurement(unsigned long nowMs) {
+  static unsigned long lastSampleMs = 0UL;
+  constexpr uint8_t medianSampleCount = 9U;
+  constexpr uint8_t movingAverageSeconds = 60U;
+  constexpr uint8_t minimumStableSamples = 20U;
+  constexpr uint8_t invalidSamplesRequired = 3U;
+  constexpr uint8_t percentConfirmationSamples = 5U;
+  constexpr unsigned long loadRecoveryMs = 10000UL;
+  static int voltageHistory[movingAverageSeconds] = {};
+  static uint8_t historyIndex = 0U;
+  static uint8_t historyCount = 0U;
+  static long historySum = 0L;
+  static uint8_t invalidSampleCount = 0U;
+  static int candidatePercent = -1;
+  static uint8_t candidatePercentCount = 0U;
+  static bool highLoadWasActive = false;
+  static unsigned long highLoadEndedMs = 0UL;
+
+  // Motor and heater current temporarily pull the cell voltage down. Those
+  // readings are not usable as state-of-charge measurements. Wait ten
+  // seconds after the load ends so the cell voltage can recover as well.
+  const bool highLoadActive =
+      directInterventionState == DIRECT_INTERVENTION_VIBRATING ||
+      directInterventionState == DIRECT_INTERVENTION_HEATING ||
+      stage5SystemController.state == STAGE5_SYSTEM_VIBRATING ||
+      stage5SystemController.state == STAGE5_SYSTEM_HEATING;
+  if (highLoadActive) {
+    highLoadWasActive = true;
+    return;
+  }
+  if (highLoadWasActive) {
+    highLoadWasActive = false;
+    highLoadEndedMs = nowMs;
+  }
+  if (highLoadEndedMs != 0UL && nowMs - highLoadEndedMs < loadRecoveryMs) {
+    return;
+  }
+  if (nowMs - lastSampleMs < BATTERY_SAMPLE_INTERVAL_MS) return;
+  lastSampleMs = nowMs;
+
+  // Reject short ADC spikes with a median instead of allowing one noisy
+  // conversion to pull the displayed percentage up or down.
+  uint32_t samples[medianSampleCount];
+  for (uint8_t i = 0U; i < medianSampleCount; ++i) {
+    samples[i] = analogReadMilliVolts(BATTERY_ADC_PIN);
+  }
+  for (uint8_t i = 1U; i < medianSampleCount; ++i) {
+    const uint32_t value = samples[i];
+    uint8_t j = i;
+    while (j > 0U && samples[j - 1U] > value) {
+      samples[j] = samples[j - 1U];
+      --j;
+    }
+    samples[j] = value;
+  }
+  const int medianBatteryMillivolts = static_cast<int>(
+      samples[medianSampleCount / 2U] * BATTERY_DIVIDER_RATIO + 0.5f);
+
+  // Reject a missing divider wire and a regulated 5 V output. The divider
+  // must be connected to the protected single-cell battery output.
+  if (medianBatteryMillivolts < 2500 || medianBatteryMillivolts > 4400) {
+    batteryMillivolts = medianBatteryMillivolts;
+    if (++invalidSampleCount >= invalidSamplesRequired) {
+      batteryPercent = -1;
+      historyIndex = 0U;
+      historyCount = 0U;
+      historySum = 0L;
+      candidatePercent = -1;
+      candidatePercentCount = 0U;
+    }
+    return;
+  }
+  invalidSampleCount = 0U;
+
+  // One median value is added each second. The displayed voltage is the
+  // average of the newest 60 values. Do not publish a provisional percentage
+  // until twenty stable, load-free seconds have been collected.
+  if (historyCount < movingAverageSeconds) {
+    voltageHistory[historyIndex] = medianBatteryMillivolts;
+    historySum += medianBatteryMillivolts;
+    ++historyCount;
+  } else {
+    historySum -= voltageHistory[historyIndex];
+    voltageHistory[historyIndex] = medianBatteryMillivolts;
+    historySum += medianBatteryMillivolts;
+  }
+  historyIndex = static_cast<uint8_t>(
+      (historyIndex + 1U) % movingAverageSeconds);
+  const int filteredBatteryMillivolts = static_cast<int>(
+      (historySum + historyCount / 2U) / historyCount);
+  batteryMillivolts = filteredBatteryMillivolts;
+  if (historyCount < minimumStableSamples) {
+    batteryPercent = -1;
+    return;
+  }
+
+  const int measuredPercent =
+      lithiumBatteryPercentFromMillivolts(filteredBatteryMillivolts);
+  if (batteryPercent < 0) {
+    batteryPercent = measuredPercent;
+    candidatePercent = -1;
+    candidatePercentCount = 0U;
+    return;
+  }
+
+  // A one-percent boundary crossing is usually ADC noise. Require a change
+  // of at least two percent to persist for five consecutive filtered samples.
+  if (abs(measuredPercent - batteryPercent) < 2) {
+    candidatePercent = -1;
+    candidatePercentCount = 0U;
+  } else if (candidatePercent >= 0 &&
+             abs(measuredPercent - candidatePercent) <= 1) {
+    if (++candidatePercentCount >= percentConfirmationSamples) {
+      batteryPercent = measuredPercent;
+      candidatePercent = -1;
+      candidatePercentCount = 0U;
+    }
+  } else {
+    candidatePercent = measuredPercent;
+    candidatePercentCount = 1U;
+  }
+}
+
+void executeSingleOkPress(unsigned long nowMs, bool heatingActive) {
+  if (heatingActive) {
+    if (temperatureSettingDirty) {
+      stage5SystemConfig.heating.setTemperatureC = pendingSetTemperatureC;
+      temperatureSettingDirty = false;
+    }
+    temperatureSettingDisplayUntilMs = nowMs + TEMP_SETTING_DISPLAY_MS;
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.print("TEMP_SET_CONFIRMED,");
+      Serial.println(stage5SystemConfig.heating.setTemperatureC, 1);
+      xSemaphoreGive(serialMutex);
+    }
+  } else if (isManualRmsRecalibrationBlocked()) {
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.println("STAGE5_BUSY_IGNORED_OK");
+      xSemaphoreGive(serialMutex);
+    }
+  } else {
+    beginRmsCalibrationCountdown(nowMs, "BUTTON");
+  }
+}
+
 void updateTemperatureButtons(unsigned long nowMs) {
-  const bool upPressed = debounceButton(
-      btnUpState, digitalRead(BTN_UP_PIN) == LOW, nowMs,
-      TEMP_BUTTON_DEBOUNCE_MS);
-  const bool downPressed = debounceButton(
-      btnDownState, digitalRead(BTN_DOWN_PIN) == LOW, nowMs,
-      TEMP_BUTTON_DEBOUNCE_MS);
-  const bool okPressed = debounceButton(
-      btnOkState, digitalRead(BTN_OK_PIN) == LOW, nowMs,
-      TEMP_BUTTON_DEBOUNCE_MS);
+  const bool upPressed =
+      readRawPullupPressEvent(BTN_UP_PIN, btnUpState.lastRawPressed,
+                              btnUpState.stablePressed,
+                              btnUpState.lastRawChangeMs,
+                              btnUpState.lastAcceptedPressMs, nowMs);
+  const bool downPressed =
+      readRawPullupPressEvent(BTN_DOWN_PIN, btnDownState.lastRawPressed,
+                              btnDownState.stablePressed,
+                              btnDownState.lastRawChangeMs,
+                              btnDownState.lastAcceptedPressMs, nowMs);
+  const bool okPressed =
+      readRawPullupPressEvent(BTN_OK_PIN, btnOkState.lastRawPressed,
+                              btnOkState.stablePressed,
+                              btnOkState.lastRawChangeMs,
+                              btnOkState.lastAcceptedPressMs, nowMs);
 
   const bool heatingActive =
       stage5SystemController.state == STAGE5_SYSTEM_HEATING ||
@@ -2248,28 +2481,42 @@ void updateTemperatureButtons(unsigned long nowMs) {
     temperatureSettingDisplayUntilMs = 0UL;
   }
 
-  // During heating, OK confirms the staged temperature. Outside heating it
-  // keeps its original role: start a new RMS baseline calibration.
+  // Two OK presses within two seconds show battery percentage. A single OK
+  // keeps its previous behavior after the double-press window expires.
   if (okPressed) {
-    if (heatingActive) {
-      if (temperatureSettingDirty) {
-        stage5SystemConfig.heating.setTemperatureC = pendingSetTemperatureC;
-        temperatureSettingDirty = false;
-      }
-      temperatureSettingDisplayUntilMs = nowMs + TEMP_SETTING_DISPLAY_MS;
+    if (okSinglePressPending &&
+        nowMs - okFirstPressMs <= OK_DOUBLE_PRESS_MS) {
+      okSinglePressPending = false;
+      okSingleActionExecuted = false;
+      batteryDisplayUntilMs = nowMs + BATTERY_DISPLAY_MS;
       if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
-        Serial.print("TEMP_SET_CONFIRMED,");
-        Serial.println(stage5SystemConfig.heating.setTemperatureC, 1);
-        xSemaphoreGive(serialMutex);
-      }
-    } else if (isManualRmsRecalibrationBlocked()) {
-      if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
-        Serial.println("STAGE5_BUSY_IGNORED_OK");
+        Serial.print("BATTERY,");
+        Serial.print(batteryPercent);
+        Serial.print(",MV=");
+        Serial.println(batteryMillivolts);
         xSemaphoreGive(serialMutex);
       }
     } else {
-      beginRmsCalibrationCountdown(nowMs, "BUTTON");
+      okSinglePressPending = true;
+      okFirstPressMs = nowMs;
+      // During heating, one OK press must confirm and show the selected
+      // temperature immediately. Keep the two-second window open so a second
+      // press can still show battery percentage.
+      if (heatingActive) {
+        executeSingleOkPress(nowMs, true);
+        okSingleActionExecuted = true;
+      } else {
+        okSingleActionExecuted = false;
+      }
     }
+  }
+  if (okSinglePressPending &&
+      nowMs - okFirstPressMs > OK_DOUBLE_PRESS_MS) {
+    okSinglePressPending = false;
+    if (!okSingleActionExecuted) {
+      executeSingleOkPress(nowMs, heatingActive);
+    }
+    okSingleActionExecuted = false;
   }
 
   if (!heatingActive) {
@@ -2508,6 +2755,50 @@ void runStage5Controller(unsigned long nowMs) {
       lastStandaloneDisplayStatus = -1;
     }
   }
+  // Battery display has priority for five seconds after a double press.
+  // Below 10%, the complete TM1637 display blinks continuously as a warning.
+  const int displayedBatteryPercent = batteryPercent;
+  const bool batteryDisplayActive = batteryDisplayUntilMs != 0UL &&
+      static_cast<long>(batteryDisplayUntilMs - nowMs) > 0L;
+  const bool lowBattery = displayedBatteryPercent >= 0 &&
+      displayedBatteryPercent < 10;
+  static bool lastBatteryOverrideActive = false;
+  static bool lastLowBatteryVisible = true;
+  const bool lowBatteryVisible = !lowBattery ||
+      ((nowMs / 500UL) % 2UL) == 0UL;
+
+  if (batteryDisplayActive) {
+    output.display.enabled = true;
+    output.display.configValid = true;
+    output.display.segments[0] =
+        TM_SEG_C | TM_SEG_D | TM_SEG_E | TM_SEG_F | TM_SEG_G;  // b
+    if (displayedBatteryPercent < 0) {
+      output.display.segments[1] = encodeTm1637Glyph(TM_GLYPH_DASH);
+      output.display.segments[2] = encodeTm1637Glyph(TM_GLYPH_DASH);
+      output.display.segments[3] = encodeTm1637Glyph(TM_GLYPH_DASH);
+    } else {
+      output.display.segments[1] = displayedBatteryPercent == 100
+          ? encodeTm1637Glyph(TM_GLYPH_1)
+          : encodeTm1637Glyph(TM_GLYPH_BLANK);
+      output.display.segments[2] = encodeTm1637Glyph(
+          static_cast<Tm1637Glyph>((displayedBatteryPercent / 10) % 10));
+      output.display.segments[3] = encodeTm1637Glyph(
+          static_cast<Tm1637Glyph>(displayedBatteryPercent % 10));
+    }
+    output.display.changed = true;
+  }
+
+  if (lowBattery && !lowBatteryVisible) {
+    output.display.enabled = true;
+    output.display.configValid = true;
+    for (uint8_t i = 0U; i < 4U; ++i) output.display.segments[i] = 0U;
+  }
+  output.display.changed = output.display.changed ||
+      batteryDisplayActive != lastBatteryOverrideActive ||
+      lowBatteryVisible != lastLowBatteryVisible;
+  lastBatteryOverrideActive = batteryDisplayActive;
+  lastLowBatteryVisible = lowBatteryVisible;
+
   applyStage5Display(output.display);
 
   // Short, non-blocking heartbeat for the PC status dashboard. It is emitted
@@ -2584,7 +2875,9 @@ void stage5PeripheralIoTask(void* pvParameters) {
   (void)pvParameters;
   TickType_t lastWakeTick = xTaskGetTickCount();
   for (;;) {
-    updateTemperatureSensor(millis());
+    const unsigned long nowMs = millis();
+    updateTemperatureSensor(nowMs);
+    updateBatteryMeasurement(nowMs);
     flushPendingStage5Display();
     vTaskDelayUntil(&lastWakeTick, pdMS_TO_TICKS(10));
   }
@@ -2600,7 +2893,9 @@ void setup() {
 
   // RMS side (runs on core 1, in loop() below).
   pinMode(EMG_ADC_PIN, INPUT);
+  pinMode(BATTERY_ADC_PIN, INPUT);
   analogReadResolution(EMG_ADC_BITS);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
   initEmgNotchFilter();
   rmsConfig.startStdMult = 3.0f;
   rmsConfig.endStdMult = 1.5f;
@@ -2785,3 +3080,4 @@ void loop() {
   // loop after 'C' had already reset the RMS baseline.
   handleSerialCommands();
 }
+
